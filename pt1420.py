@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
-pt1420.py  -  Print op de Powertech PT-1420 (mini thermische "cat printer")
-via Bluetooth LE.
+pt1420.py  -  Drive the Powertech PT-1420 mini thermal printer from a
+laptop/desktop over Bluetooth LE.
 
-De PT-1420 adverteert als 'X6h-0000' en spreekt het klassieke cat-printer
-protocol (service AE30, schrijf-characteristic AE01). De USB-C poort laadt
-alleen op - printen gaat uitsluitend over BLE.
+The PT-1420 is a rebranded "cat printer" module: its USB-C port only charges,
+and all printing happens over Bluetooth LE. It advertises as 'X6h-...' and
+speaks the classic cat-printer protocol (service AE30, write characteristic
+AE01). This module renders text or images to a 384px-wide 1-bit raster and
+sends it to the printer.
 
-Gebruik als module:
+As a library:
+
     import asyncio, pt1420
-    asyncio.run(pt1420.print_text("Γεια σου!\\nHallo!"))
+    asyncio.run(pt1420.print_text("Hello!\\nΓεια σου!"))
+    asyncio.run(pt1420.print_image(pt1420.image_from_file("logo.png")))
 
-Gebruik vanaf de command line:
-    python3 pt1420.py "Γεια σου!"          # tekst printen
-    echo "hallo" | python3 pt1420.py -     # vanaf stdin
-    python3 pt1420.py --file brief.txt      # een bestand
+As a command-line tool:
+
+    python3 pt1420.py "Hello, world!"      # print text
+    echo "hi" | python3 pt1420.py -        # print from stdin
+    python3 pt1420.py --file notes.txt     # print a text file
+    python3 pt1420.py --image photo.png    # print an image (dithered)
+
+Requirements: `pip install bleak pillow`. Tested on macOS; works anywhere
+`bleak` supports (Linux/Windows) since it only talks BLE.
 """
 
 from __future__ import annotations
@@ -27,23 +36,23 @@ import sys
 from PIL import Image, ImageDraw, ImageFont
 from bleak import BleakScanner, BleakClient
 
-# --- BLE identiteit ---------------------------------------------------------
-# De PT-1420 adverteert als 'X6h-...'. Het BLE-adres verschilt per Mac/toestel,
-# dus standaard zoeken we op naam. Zet PT1420_ADDRESS in de omgeving om een
-# specifiek adres (macOS CoreBluetooth-UUID) af te dwingen.
+# --- BLE identity -----------------------------------------------------------
+# The PT-1420 advertises as 'X6h-...'. Its BLE address differs per host/device,
+# so by default we discover it by name. Set PT1420_ADDRESS to force a specific
+# address (a macOS CoreBluetooth UUID, or a MAC on Linux/Windows).
 NAME_HINT = os.environ.get("PT1420_NAME", "X6h")
 ADDRESS = os.environ.get("PT1420_ADDRESS", "")
 CHAR_WRITE = "0000ae01-0000-1000-8000-00805f9b34fb"   # write-without-response
-CHAR_NOTIFY = "0000ae02-0000-1000-8000-00805f9b34fb"  # status notify
+CHAR_NOTIFY = "0000ae02-0000-1000-8000-00805f9b34fb"  # status notifications
 
-# --- print-parameters -------------------------------------------------------
-WIDTH = 384              # 58mm kop = 384 dots
+# --- print parameters -------------------------------------------------------
+WIDTH = 384              # 58mm print head = 384 dots
 MARGIN = 6
-MSB_FIRST = False        # bit-volgorde: LSB-first is correct voor dit toestel
+MSB_FIRST = False        # bit order within a byte; LSB-first is correct here
 BLACK_THRESHOLD = 128
-ENERGY = 0x3FFF          # donkerheid; hoger = donkerder
+ENERGY = 0x3FFF          # darkness; higher = darker
 
-# Monospace font met Griekse glyphs. Overschrijf met PT1420_FONT.
+# Monospace font with Greek/Latin glyphs. Override with PT1420_FONT.
 FONT_CANDIDATES = [
     "/System/Library/Fonts/Menlo.ttc",                        # macOS
     "/Library/Fonts/DejaVuSansMono.ttf",
@@ -55,7 +64,7 @@ def find_font() -> str:
     override = os.environ.get("PT1420_FONT")
     if override and os.path.exists(override):
         return override
-    # matplotlib bundelt DejaVu Sans Mono (met Grieks) en is vaak aanwezig.
+    # matplotlib bundles DejaVu Sans Mono (wide glyph coverage) and is common.
     try:
         import matplotlib.font_manager as fm
         path = fm.findfont("DejaVu Sans Mono", fallback_to_default=False)
@@ -66,10 +75,10 @@ def find_font() -> str:
     for path in FONT_CANDIDATES:
         if os.path.exists(path):
             return path
-    raise FileNotFoundError("Geen monospace-font met Grieks gevonden. Zet PT1420_FONT.")
+    raise FileNotFoundError("No monospace font found. Set PT1420_FONT to a .ttf path.")
 
 
-# --- protocol ---------------------------------------------------------------
+# --- cat-printer protocol ---------------------------------------------------
 def crc8(data: bytes) -> int:
     crc = 0
     for b in data:
@@ -87,16 +96,16 @@ def _cmd(command: int, payload: bytes) -> bytes:
 
 _GET_STATE = _cmd(0xA3, b"\x00")
 _QUALITY   = _cmd(0xA4, b"\x32")                 # 200 dpi
-_MODE_IMG  = _cmd(0xBE, b"\x00")                 # 0 = beeld, 1 = tekst
+_MODE_IMG  = _cmd(0xBE, b"\x00")                 # 0 = image, 1 = text
 _ENERGY    = _cmd(0xAF, bytes([ENERGY & 0xFF, (ENERGY >> 8) & 0xFF]))
 _LAT_ON    = _cmd(0xA6, bytes([0xAA,0x55,0x17,0x38,0x44,0x5F,0x5F,0x5F,0x44,0x38,0x2C]))
 _LAT_OFF   = _cmd(0xA6, bytes([0xAA,0x55,0x17,0x00,0x00,0x00,0x00,0x00,0x00,0x17,0x11]))
 _FEED      = _cmd(0xA1, bytes([0x30, 0x00]))
 
 
-# --- tekst -> 1-bit afbeelding ----------------------------------------------
+# --- content -> 1-bit image -------------------------------------------------
 def fit_font(font_path: str, longest_chars: int) -> ImageFont.FreeTypeFont:
-    """Kies de grootste monospace-fontgrootte zodat `longest_chars` past."""
+    """Pick the largest monospace size so `longest_chars` fit the print width."""
     usable = WIDTH - 2 * MARGIN
     probe = ImageFont.truetype(font_path, 40)
     w40 = probe.getlength("0" * max(1, longest_chars))
@@ -105,7 +114,7 @@ def fit_font(font_path: str, longest_chars: int) -> ImageFont.FreeTypeFont:
 
 
 def text_to_image(text: str, font_path: str | None = None) -> Image.Image:
-    """Render meerregelige tekst naar een 1-bit afbeelding van WIDTH px breed."""
+    """Render multi-line text to a 1-bit image WIDTH px wide (auto-fit font)."""
     font_path = font_path or find_font()
     lines = text.replace("\t", "    ").split("\n")
     longest = max((len(l) for l in lines), default=1)
@@ -113,18 +122,33 @@ def text_to_image(text: str, font_path: str | None = None) -> Image.Image:
 
     asc, desc = font.getmetrics()
     line_h = asc + desc + 2
-    H = MARGIN + line_h * len(lines) + MARGIN + 72   # extra witruimte om af te scheuren
+    height = MARGIN + line_h * len(lines) + MARGIN + 72   # trailing feed room
 
-    img = Image.new("L", (WIDTH, H), 255)
-    d = ImageDraw.Draw(img)
+    img = Image.new("L", (WIDTH, height), 255)
+    draw = ImageDraw.Draw(img)
     y = MARGIN
-    for ln in lines:
-        d.text((MARGIN, y), ln, font=font, fill=0)
+    for line in lines:
+        draw.text((MARGIN, y), line, font=font, fill=0)
         y += line_h
     return img.point(lambda p: 0 if p < BLACK_THRESHOLD else 255, mode="1")
 
 
+def image_from_file(path: str, dither: bool = True) -> Image.Image:
+    """Load any image, scale to the print width, and reduce to 1-bit."""
+    src = Image.open(path).convert("L")
+    if src.width != WIDTH:
+        h = max(1, round(src.height * WIDTH / src.width))
+        src = src.resize((WIDTH, h), Image.LANCZOS)
+    mono = src.convert("1") if dither else src.point(
+        lambda p: 0 if p < BLACK_THRESHOLD else 255, mode="1")
+    # add a little white tail so the last rows clear the tear bar
+    out = Image.new("1", (WIDTH, mono.height + 64), 1)
+    out.paste(mono, (0, 0))
+    return out
+
+
 def image_to_stream(img: Image.Image) -> bytes:
+    """Encode a 1-bit image as a full cat-printer command stream."""
     px = img.load()
     W, H = img.size
     out = bytearray()
@@ -132,7 +156,7 @@ def image_to_stream(img: Image.Image) -> bytes:
     for y in range(H):
         row = bytearray(WIDTH // 8)
         for x in range(WIDTH):
-            if x < W and px[x, y] == 0:            # mode '1': 0 == zwart
+            if x < W and px[x, y] == 0:            # mode '1': 0 == black
                 if MSB_FIRST:
                     row[x >> 3] |= 0x80 >> (x & 7)
                 else:
@@ -142,7 +166,7 @@ def image_to_stream(img: Image.Image) -> bytes:
     return bytes(out)
 
 
-# --- BLE-verzending ---------------------------------------------------------
+# --- BLE transport ----------------------------------------------------------
 async def _find_device():
     if ADDRESS:
         dev = await BleakScanner.find_device_by_address(ADDRESS, timeout=15)
@@ -156,26 +180,26 @@ async def _find_device():
 async def print_image(img: Image.Image, verbose: bool = True) -> None:
     stream = image_to_stream(img)
     if verbose:
-        print(f"Afbeelding {img.size[0]}x{img.size[1]} -> {len(stream)} bytes.")
+        print(f"Image {img.size[0]}x{img.size[1]} -> {len(stream)} bytes.")
     dev = await _find_device()
     if dev is None:
-        raise RuntimeError("Printer niet gevonden. Staat hij aan en vrij (niet op een telefoon)?")
+        raise RuntimeError("Printer not found. Is it ON and free (not on a phone)?")
     if verbose:
-        print(f"Verbinden met {dev.name or '(geen naam)'} ...")
+        print(f"Connecting to {dev.name or '(no name)'} ...")
     async with BleakClient(dev) as client:
         if verbose:
-            print("Verbonden:", client.is_connected)
+            print("Connected:", client.is_connected)
         try:
             await client.start_notify(CHAR_NOTIFY,
                                       lambda _, d: verbose and print("  <-", d.hex()))
         except Exception:
             pass
-        for i in range(0, len(stream), 120):
+        for i in range(0, len(stream), 120):     # write-without-response, paced
             await client.write_gatt_char(CHAR_WRITE, stream[i:i + 120], response=False)
             await asyncio.sleep(0.02)
-        await asyncio.sleep(4)     # laten leegdraaien voor het verbreken
+        await asyncio.sleep(4)                    # let it flush before disconnect
     if verbose:
-        print("Klaar.")
+        print("Done.")
 
 
 async def print_text(text: str, font_path: str | None = None, verbose: bool = True) -> None:
@@ -183,22 +207,27 @@ async def print_text(text: str, font_path: str | None = None, verbose: bool = Tr
 
 
 # --- command line -----------------------------------------------------------
-def _read_input(args) -> str:
+def _read_text(args) -> str:
     if args.file:
         return open(args.file, encoding="utf-8").read()
     if args.text == ["-"] or (not args.text and not sys.stdin.isatty()):
         return sys.stdin.read()
     if args.text:
         return " ".join(args.text)
-    raise SystemExit("Niets om te printen. Geef tekst, --file of pipe via stdin.")
+    raise SystemExit("Nothing to print. Give text, --file, --image, or pipe stdin.")
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Print tekst op de Powertech PT-1420 (BLE).")
-    p.add_argument("text", nargs="*", help="Tekst om te printen (of '-' voor stdin).")
-    p.add_argument("--file", help="Print de inhoud van dit bestand.")
+    p = argparse.ArgumentParser(description="Print text or an image on the Powertech PT-1420 (BLE).")
+    p.add_argument("text", nargs="*", help="Text to print (or '-' for stdin).")
+    p.add_argument("--file", help="Print the contents of this text file.")
+    p.add_argument("--image", help="Print this image file (scaled + dithered).")
     args = p.parse_args()
-    asyncio.run(print_text(_read_input(args)))
+
+    if args.image:
+        asyncio.run(print_image(image_from_file(args.image)))
+    else:
+        asyncio.run(print_text(_read_text(args)))
     return 0
 
 
